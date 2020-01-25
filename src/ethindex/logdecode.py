@@ -40,6 +40,9 @@ def build_address_to_abi_dict(
 
     for network in addresses_json["networks"]:
         add_abi(network, "CurrencyNetwork")
+
+    for network_shield in addresses_json["network_shields"]:
+        add_abi(network_shield, "CurrencyNetworkShield")
     
     for network_gateway in addresses_json["network_gateways"]:
         add_abi(network_gateway, "CurrencyNetworkGateway")

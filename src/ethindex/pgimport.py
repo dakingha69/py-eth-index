@@ -49,16 +49,220 @@ def get_events(web3, topic_index, fromBlock, toBlock) -> Iterable[logdecode.Even
 def hexlify(d):
     return "0x" + binascii.hexlify(d).decode()
 
+def bytes_to_hex(bytes_or_any):
+    if type(bytes_or_any) is bytes:
+        return hexlify(bytes_or_any)
+    return bytes_or_any
 
-def bytesArgsToHex(args):
+def bytes_args_to_hex(args):
     for key in args:
-        if type(args[key]) is bytes:
-            args[key] = hexlify(args[key])
+        if type(args[key]) is tuple:
+            args[key] = [
+                bytes_to_hex(list_item)
+                for list_item in args[key]
+            ]
+        else:
+            args[key] = bytes_to_hex(args[key])
     return args
 
+"""
+Merkle tree
+"""
+def get_merkle_tree_meta_data(cur, merkle_tree_address: str):
+    cur.execute(
+        """
+        SELECT * FROM merkle_tree_metadata WHERE merkleTreeAddress=%s
+        """,
+        (merkle_tree_address,)
+    )
+    meta_data = cur.fetchone()
+    if meta_data is None:
+        return util.get_initial_metadata(merkle_tree_address)
+    return meta_data
+
+
+def get_latest_leaf_index(cur, merkle_tree_address: str):
+    cur.execute(
+        """
+        SELECT MAX(leafindex) FROM merkle_tree_nodes
+        """
+    )
+    row = cur.fetchone()
+    if row is None:
+        return 0
+    return row["max"]
+
+def get_leaves_by_leaf_index_range(cur, merkle_tree_address, from_leaf_index, to_leaf_index):
+    cur.execute(
+        """
+        SELECT * from merkle_tree_nodes WHERE merkleTreeAddress=%s AND leafIndex>=%s AND leafIndex<=%s
+        """,
+        (merkle_tree_address, from_leaf_index, to_leaf_index,)
+    )
+    return cur.fetchall()
+
+def insert_merkle_tree_meta(
+    cur,
+    merkle_tree_address,
+    tree_height,
+    latest_block_number,
+    latest_root,
+    latest_leaf_index,
+    latest_frontier
+):
+    cur.execute(
+        """
+        INSERT INTO merkle_tree_metadata (
+            merkleTreeAddress,
+            treeHeight,
+            latestBlockNumber,
+            latestRoot,
+            latestLeafIndex,
+            latestFrontier
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (merkleTreeAddress)
+        DO UPDATE SET (
+            latestBlockNumber,
+            latestRoot,
+            latestLeafIndex,
+            latestFrontier
+        ) = (
+            EXCLUDED.latestBlockNumber,
+            EXCLUDED.latestRoot,
+            EXCLUDED.latestLeafIndex,
+            EXCLUDED.latestFrontier
+        );
+        """,
+        (
+            merkle_tree_address,
+            tree_height,
+            latest_block_number,
+            latest_root,
+            latest_leaf_index,
+            latest_frontier,
+        )
+    )
+    logger.info("[MT] Metadata for: %s updated. Latest leaf index: %s", merkle_tree_address, latest_leaf_index)
+
+def insert_merkle_tree_node(
+    cur,
+    merkle_tree_address,
+    node_index,
+    value,
+    block_number,
+    leaf_index=None
+):
+    cur.execute(
+        """
+        INSERT INTO merkle_tree_nodes (
+            merkleTreeAddress,
+            nodeIndex,
+            value,
+            blockNumber,
+            leafIndex
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (merkleTreeAddress, nodeIndex)
+        DO UPDATE SET (
+            value,
+            blockNumber,
+            leafIndex
+        ) = (
+            EXCLUDED.value,
+            EXCLUDED.blockNumber,
+            EXCLUDED.leafIndex
+        );
+        """,
+        (merkle_tree_address, node_index, value, block_number, leaf_index,)
+    )
+    logger.info("[MT] Node with node index %s and leaf index %s inserted", node_index, leaf_index)
+
+def insert_merkle_tree_leaves(cur, event: logdecode.Event):    
+    if event.name == "NewLeaf":
+        logger.info("[MT] NewLeaf event")
+        leaf_index = event.args["leafIndex"]
+        value = event.args["leafValue"]
+        leaves_to_insert = [(
+            leaf_index,
+            value
+        )]
+    else:
+        logger.info("[MT] NewLeaves event")
+        min_leaf_index = event.args["minLeafIndex"]
+        leaf_values = event.args["leafValues"]
+        leaves_to_insert = [(
+            min_leaf_index + i,
+            leaf_value
+        ) for i, leaf_value in enumerate(leaf_values)]
+
+    for leaf in leaves_to_insert:
+        insert_merkle_tree_node(
+            cur,
+            merkle_tree_address=event.address,
+            block_number=event.blocknumber,
+            leaf_index=leaf[0],
+            node_index=util.leaf_index_to_node_index(leaf[0]),
+            value=leaf[1]
+        )
+
+    logger.info("[MT] %s leaf/leaves inserted.", len(leaves_to_insert))
+    update_merkle_tree(cur, event.address, event.blocknumber)
+
+
+def update_merkle_tree(
+    cur,
+    merkle_tree_address,
+    block_number,
+) -> None:
+    """
+    Recalculate nodes in db on new leaves
+    """
+    meta_data = get_merkle_tree_meta_data(cur, merkle_tree_address)
+
+    # determine range of leaf indices to update
+    from_leaf_index = meta_data["latestleafindex"]
+    if from_leaf_index != 0:
+        from_leaf_index += 1
+    to_leaf_index = get_latest_leaf_index(cur, merkle_tree_address)
+
+    if meta_data["latestleafindex"] < to_leaf_index or meta_data["latestleafindex"] == 0:
+        logger.info("[MT] Updating merkle tree from leaf %s to leaf %s", from_leaf_index, to_leaf_index)
+
+        number_of_hashes = util.get_number_of_hashes(to_leaf_index, from_leaf_index)
+        logger.info("[MT] %s hashes required to update tree", number_of_hashes)
+
+        frontier = meta_data["latestfrontier"]
+        leaf_values = [
+            leaf["value"] for leaf in get_leaves_by_leaf_index_range(cur, merkle_tree_address, from_leaf_index, to_leaf_index)
+        ]
+        logger.info("[MT] leaf vaules: %s", len(leaf_values))
+        
+        current_leaf_count = from_leaf_index
+
+        def update_node_cb(node_index, node_value):
+            insert_merkle_tree_node(cur, merkle_tree_address, node_index, node_value, block_number)
+        root, new_frontier = util.update_nodes(leaf_values, current_leaf_count, frontier, update_node_cb)
+    
+        logger.info("[MT] Merkle tree updated. New root %s", root)
+
+        insert_merkle_tree_meta(
+            cur,
+            merkle_tree_address,
+            tree_height=util.TREE_HEIGHT,
+            latest_block_number=block_number,
+            latest_root=root,
+            latest_leaf_index=to_leaf_index,
+            latest_frontier=new_frontier
+        )
+    else:
+        logger.info("[MT] Merkle tree already up to date.")
+        
 
 def insert_event(cur, event: logdecode.Event) -> None:
-    event.args = bytesArgsToHex(event.args)
+    event.args = bytes_args_to_hex(event.args)
+
+    if event.name == "NewLeaf" or event.name == "NewLeaves":
+        insert_merkle_tree_leaves(cur, event)
+
     cur.execute(
         """INSERT INTO events (transactionHash,
                                        blockNumber,
@@ -402,30 +606,49 @@ def do_createtables(conn):
             cur.execute(
                 """
                 CREATE TABLE events (
-                     transactionHash TEXT NOT NULL,
-                     blockNumber INTEGER NOT NULL,
-                     address TEXT NOT NULL,
-                     eventName TEXT NOT NULL,
-                     args JSONB,
-                     blockHash TEXT NOT NULL,
-                     transactionIndex INTEGER NOT NULL,
-                     logIndex INTEGER NOT NULL,
-                     timestamp INTEGER NOT NULL,
-                     PRIMARY KEY(transactionHash, address, blockHash, transactionIndex, logIndex)
-                   );
+                    transactionHash TEXT NOT NULL,
+                    blockNumber INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    eventName TEXT NOT NULL,
+                    args JSONB,
+                    blockHash TEXT NOT NULL,
+                    transactionIndex INTEGER NOT NULL,
+                    logIndex INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    PRIMARY KEY(transactionHash, address, blockHash, transactionIndex, logIndex)
+                );
 
-                  CREATE TABLE sync (
+                CREATE TABLE sync (
                     syncid TEXT NOT NULL PRIMARY KEY,
                     last_block_number INTEGER NOT NULL,
                     addresses TEXT[] NOT NULL,
                     last_confirmed_block_number INTEGER NOT NULL,
                     latest_block_hash TEXT NOT NULL
-                  );
+                );
 
-                  CREATE TABLE abis (
+                CREATE TABLE abis (
                     contract_address TEXT NOT NULL PRIMARY KEY,
                     abi JSONB NOT NULL
-                  );"""
+                );
+
+                CREATE TABLE merkle_tree_nodes (
+                    merkleTreeAddress TEXT NOT NULL,
+                    nodeIndex BIGINT NOT NULL,
+                    leafIndex BIGINT,
+                    blockNumber INTEGER,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY(merkleTreeAddress, nodeIndex)  
+                );
+
+                CREATE TABLE merkle_tree_metadata (
+                    merkleTreeAddress TEXT NOT NULL PRIMARY KEY,
+                    treeHeight INTEGER NOT NULL,
+                    latestBlockNumber INTEGER NOT NULL,
+                    latestRoot TEXT NOT NULL,
+                    latestLeafIndex BIGINT NOT NULL,
+                    latestFrontier TEXT[] NOT NULL
+                );
+                """
             )
 
 
