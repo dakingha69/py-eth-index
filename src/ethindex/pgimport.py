@@ -234,7 +234,7 @@ def update_merkle_tree(
         leaf_values = [
             leaf["value"] for leaf in get_leaves_by_leaf_index_range(cur, merkle_tree_address, from_leaf_index, to_leaf_index)
         ]
-        logger.info("[MT] leaf vaules: %s", len(leaf_values))
+        logger.info("[MT] leaf values: %s", len(leaf_values))
         
         current_leaf_count = from_leaf_index
 
