@@ -15,7 +15,7 @@ Merkle tree node utilities
 """
 TREE_HEIGHT = 32
 TREE_WIDTH = 2 ** 32
-NODE_HASH_LENGTH = 32
+NODE_HASH_LENGTH = 27 # expected length of nodes' values up the merkle tree, in bytes
 ZERO_HASH = "0x000000000000000000000000000000000000000000000000000000"
 
 def get_initial_metadata(merkle_tree_address):
@@ -29,12 +29,11 @@ def get_initial_metadata(merkle_tree_address):
   }
 
 def concatenate_then_hash(items):
-  concat_value = "".join([
-    eth_utils.remove_0x_prefix(item)
+  concat_bytes = b''.join([
+    eth_utils.to_bytes(hexstr=item)
     for item in items
   ])
-  hash_bytes = hashlib.sha256(eth_utils.to_bytes(hexstr=concat_value)).digest()
-  return eth_utils.to_hex(hash_bytes)
+  return eth_utils.add_0x_prefix(hashlib.sha256(concat_bytes).hexdigest())
 
 def right_shift(integer, shift):
   return math.floor(integer / 2 ** shift)
@@ -57,16 +56,15 @@ def get_number_of_hashes(max_leaf_index, min_leaf_index, height=TREE_HEIGHT):
   hash_count = 0
   hi = max_leaf_index
   lo = min_leaf_index
-  batch_size = max_leaf_index - min_leaf_index + 1
+  batch_size = hi - lo + 1
   bin_hi = bin(hi)
-  bit_length = len(bin_hi)
-
+  bit_length = len(bin_hi[2:])
   for i in range(0, bit_length):
     increment = hi - lo
     hash_count += increment
     hi = right_shift(hi, 1)
     lo = right_shift(lo, 1)
-
+  print(hi, lo, batch_size, bin_hi, bit_length)
   return hash_count + height - (batch_size - 1)
 
 def get_frontier_slot(leaf_index):
@@ -109,6 +107,7 @@ def update_nodes(
 
     if slot == 0:
       new_frontier[slot] = node_value
+      continue
 
     for level in range(1, slot + 1):
       if node_index % 2 == 0:
@@ -121,13 +120,16 @@ def update_nodes(
           node_value,
           ZERO_HASH
         ])
-        node_value = eth_utils.add_0x_prefix(node_value_full[-NODE_HASH_LENGTH * 2])
-      
+      node_value = eth_utils.add_0x_prefix(node_value_full[-NODE_HASH_LENGTH * 2:])
       node_index = parent_node_index(node_index)
       update_node_cb(node_index, node_value)
 
     new_frontier[slot] = node_value
-  
+
+  """
+  So far all leaves added and hashed up to particular level of tree.
+  Now need to continue hashing from that level to root.
+  """
   for level in range(slot + 1, TREE_HEIGHT + 1):
     if node_index % 2 == 0:
       node_value_full = concatenate_then_hash([
@@ -152,10 +154,10 @@ def update_nodes(
       "node_index": node_index
     }
     if node_index == 0:
-      node["value"] = node_value_full
+      node["value"] = eth_utils.add_0x_prefix(node_value_full)
     
     update_node_cb(node_index, node_value=node["value"])
   
-  root = node_value_full
+  root = eth_utils.add_0x_prefix(node_value_full)
   return (root, new_frontier)
 
