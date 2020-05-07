@@ -47,9 +47,6 @@ def build_address_to_abi_dict(
     for network_gateway in addresses_json["network_gateways"]:
         add_abi(network_gateway, "CurrencyNetworkGateway")
 
-    for gateway_escrow in addresses_json["gateway_escrows"]:
-        add_abi(gateway_escrow, "Escrow")
-
     if "unwEth" in addresses_json:
         add_abi(addresses_json["unwEth"], "UnwEth")
     if "exchange" in addresses_json:
